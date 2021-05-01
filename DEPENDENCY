@@ -1,0 +1,20 @@
+Python 3.8.6 (default, Nov 17 2020, 10:46:00) 
+[Clang 12.0.0 (clang-1200.0.32.27)] on darwin
+
+
+### dev setup
+
+pip3 install virtualenv
+sudo easy_install virtualenv
+virtualenv -p python3 ml_test
+cd ml_test
+source bin/activate
+pip install notebook tmm numpy scipy matplotlib p_tqdm ipywidgets pandas tensorflow keras
+python -m ipykernel install --user --name=ml_test
+# vim /Users/username/Library/Jupyter/kernels/ml_test/kernel.json
+jupyter-notebok
+
+
+### runtime
+
+pip3 install tmm numpy scipy matplotlib p_tqdm ipywidgets pandas tensorflow keras
