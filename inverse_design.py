@@ -295,7 +295,7 @@ class inverse_model:
                   {"mse": tf.keras.losses.mean_squared_error(
                     self._normalize(input_spectrum,self.mean_y,self.std_y),
                     self.model_forward(input_forward)
-                    )[0],
+                    )[0].numpy()/2,
                    "true":(self.ks, input_spectrum),
                    "pred":(self.ks, output_forward)
                   },
@@ -306,7 +306,7 @@ class inverse_model:
                             self._normalize(np.array(output_spectrum),self.mean_y,self.std_y),
                             (1, self.config["spectral_resolution"])
                         )
-                        )[0],
+                        )[0].numpy()/2,
                    "true":(self.ks, input_spectrum),
                    "pred":(self.ks, output_spectrum)
                   }
