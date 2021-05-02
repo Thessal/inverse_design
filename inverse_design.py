@@ -9,6 +9,7 @@ from p_tqdm import p_map
 from scipy.spatial.distance import squareform, pdist
 import keras
 import hashlib
+import random
 
 
 def convert(number: float, type_str: str, convert_str: str, length_unit_in_meter=150e-9, n=1):
@@ -42,15 +43,23 @@ def generate_structure_all(config):
     #
     # Define uniform search parameter space, No material dispersion
     #
-    resolution = math.ceil(config["simulation_count"] ** (1 / config["layer_count"]))
+    search_size = config["simulation_count"]
+    resolution = math.ceil(search_size ** (1 / config["layer_count"]))
     space_size = resolution ** config["layer_count"]
     ignore_below = 1e-12
     _digits = -math.floor(math.log(ignore_below, 10))
     d = [round(x, _digits) for x in np.linspace(config["d_min"], config["d_max"], resolution)]
     params = itertools.product(*([d] * config["layer_count"]))
-    for i, p in enumerate(params):
-        if i == config["simulation_count"]: break
-        yield generate_structure(config, p)
+    if search_size < space_size * 0.8 :
+        print(f"Warning : search space skewed ({search_size}/{space_size})")
+    outputs = [generate_structure(config, p) for p in params]
+    random.seed(42)
+    random.shuffle(outputs)
+    for structure in outputs[:search_size]:
+        yield structure
+#     for i, p in enumerate(params):
+#         if i == config["simulation_count"]: break
+#         yield generate_structure(config, p)
 
 
 def get_parameter_count(config: dict):
@@ -95,25 +104,28 @@ def calculate_spectrum_all(config):
     return df
 
 
-def filter_similar_spectrum(config, df, thres_ratio=0.1, plot=False):
+def filter_similar_spectrum(config, df, thres_corr=0.2, thres_ratio=None, plot=False):
     #
     # Filter spectrum by euclidian distance
     # However it is still overdetermined 
     # 
-    assert (0 <= thres_ratio <= 1)
+    assert (0 <= thres_corr <= 1)
     assert (df.shape == (config["simulation_count"], get_parameter_count(config) + config["spectral_resolution"]))
     distance = pdist(df.iloc[:, get_parameter_count(config):])
     dist_mat = pd.DataFrame(np.triu(squareform(distance)))
     maxcorr = dist_mat.max()
-    thres = np.quantile(maxcorr, thres_ratio)
+    thres = thres_corr 
+    if thres_ratio : 
+        assert (0 <= thres_ratio <= 1)
+        thres = np.quantile(maxcorr, thres_ratio)
     if plot:
         import matplotlib.pyplot as plt
         plt.figure()
         plt.matshow(dist_mat, cmap='Greys', vmin=0, vmax=1)
-        # plt.figure()
-        # plt.hist(distance,bins=50)
-        # plt.figure()
-        # maxcorr.hist(bins=50)
+        plt.figure()
+        plt.hist(distance,bins=50)
+        plt.figure()
+        maxcorr.hist(bins=50)
         plt.figure()
         plt.matshow(dist_mat.loc[maxcorr < thres, maxcorr < thres], cmap='Greys', vmin=0, vmax=1)
     return df[maxcorr < thres]
@@ -121,7 +133,7 @@ def filter_similar_spectrum(config, df, thres_ratio=0.1, plot=False):
 
 def train_test_split(df, ratio):
     train_count = math.floor(df.shape[0] * ratio)
-    df.reindex(np.random.permutation(df.index))
+    #df.reindex(np.random.permutation(df.index),inplace=True)
     df = df.reindex(np.random.permutation(df.index))
     df_train = df.iloc[:train_count, :]
     df_train.reset_index(inplace=True, drop=True)
@@ -137,7 +149,7 @@ import tensorflow as tf
 
 
 class inverse_model:
-    normalizer = Normalization()
+#     normalizer = Normalization()
     history_forward = None
     history_backward = None
 
@@ -146,12 +158,15 @@ class inverse_model:
         f1 = convert(config["spectral_range"][1], "c/a", "/nm")
         f2 = convert(config["spectral_range"][0], "c/a", "/nm")
         self.ks = np.linspace(f1, f2, config["spectral_resolution"])
+        self.mean = 0.5 * (self.config["d_max"] + self.config["d_min"])
+        self.std = 0.5 * (self.config["d_max"] - self.config["d_min"])
 
         self.model_forward = Sequential([
             keras.Input(shape=(get_parameter_count(config))),
-            Dense(config["spectral_resolution"], activation='relu'),
-            Dense(config["spectral_resolution"] * 2.5, activation='relu'),
-            Dense(config["spectral_resolution"]),
+            Dense(config["spectral_resolution"] * 2.5, activation='tanh'),
+            Dense(config["spectral_resolution"] * 2.5, activation='tanh'),
+            Dense(config["spectral_resolution"] * 2.5, activation='tanh'),
+            Dense(config["spectral_resolution"], activation='tanh'),
         ])
         self.model_forward.compile(optimizer='adam',
                                    loss=tf.keras.losses.mse,
@@ -159,9 +174,9 @@ class inverse_model:
                                    #metrics=['accuracy'])
 
         self.model_backward = Sequential([keras.Input(shape=(config["spectral_resolution"])),
-                                          Dense(config["spectral_resolution"] * 2.5, activation='relu'),
-                                          Dense(config["spectral_resolution"], activation='relu'),
-                                          Dense(get_parameter_count(config), activation='relu'),
+                                          Dense(config["spectral_resolution"] * 2.5, activation='tanh'),
+                                          Dense(config["spectral_resolution"], activation='tanh'),
+                                          Dense(get_parameter_count(config), activation='tanh'),
                                           ] + self.model_forward.layers)
         self.model_backward.compile(optimizer='adam',
                                     loss=tf.keras.losses.mse,
@@ -182,42 +197,49 @@ class inverse_model:
 
     def train(self, df, train_epochs=10):
         # Prepare data 
-        X = df.iloc[:, :get_parameter_count(self.config)]
-        Y = df.iloc[:, get_parameter_count(self.config):]
+        df_train, df_test = train_test_split(df,0.5)
+        X = df_train.iloc[:, :get_parameter_count(self.config)]
+        Y = df_train.iloc[:, get_parameter_count(self.config):]
+        val_X = df_test.iloc[:, :get_parameter_count(self.config)]
+        val_Y = df_test.iloc[:, get_parameter_count(self.config):]
 
-        self.normalizer.adapt(X.values)
-
+        X = self._normalize(X,mean=self.mean,std=self.std)
+        Y = self._normalize(Y,0.5,2)
+        val_X = self._normalize(val_X,mean=self.mean,std=self.std)
+        val_Y = self._normalize(val_Y,0.5,2)
+        
         # forward train
-        self.history_forward = self.model_forward.fit(x=self.normalizer(X), y=Y.values, epochs=train_epochs)
+        self.history_forward = self.model_forward.fit(x=X.values, y=Y.values, epochs=train_epochs, verbose = 0, validation_data =(val_X.values,val_Y.values) )
 
         # backward train
         self.freeze()
-        self.history_backward = self.model_backward.fit(x=Y.values, y=Y.values, epochs=train_epochs)
+        self.history_backward = self.model_backward.fit(x=Y.values, y=Y.values, epochs=train_epochs, verbose = 0, validation_data = (np.ones((1,200))*0.1 , np.ones((1,200))*0.1) )
 
     def show_history(self):
         import matplotlib.pyplot as plt
-        plt.plot(self.history_forward.history['loss'])
-        # plt.plot(history_forward.history['val_loss'])
-        plt.show()
-        plt.plot(self.history_backward.history['loss'])
-        # plt.plot(history_backward.history['val_loss'])
-        plt.show()
+        if self.history_forward:
+            plt.plot(self.history_forward.history['loss'])
+            plt.plot(self.history_forward.history['val_loss'])
+            plt.show()
+        if self.history_backward:
+            plt.plot(self.history_backward.history['loss'])
+            plt.plot(self.history_backward.history['val_loss'])
+            plt.show()
 
     # Inverse design
+    
+    def _normalize(self,X,mean=0.5,std=2):
+        # X : numpy array
+        # std : (max-min)/2
+        return (X - mean) / std
 
-    def _denormalize(self, tensor):
-        output = []
-        for x, y, z in zip(
-                np.array(self.normalizer.mean),
-                np.array(self.normalizer.variance),
-                np.array(tensor[0])
-        ):
-            output.append(x + math.sqrt(y) * z)
-        return output
+    def _denormalize(self, tensor,mean=0.5,std=2):
+        return list(np.array(tensor[0]) * std + mean)
 
     def design(self, spectrum):
+        spectrum = [self._normalize(x,0.5,2) for x in spectrum]
         input_ = tf.reshape(tf.convert_to_tensor(spectrum), (1, self.config["spectral_resolution"]))
-        output_ = self._denormalize(self.model_inverse(input_))
+        output_ = self._denormalize(self.model_inverse(input_), mean=self.mean,std=self.std)
         #         output_structure = {"d" : [np.inf, *output_, np.inf],
         #                      "n": [1.0]+[1.4,2.1]*(len(output_)//2)+[1.0]}
         output_structure = generate_structure(self.config, output_)
@@ -225,19 +247,36 @@ class inverse_model:
         return output_structure, output_spectrum
 
     def test(self, df):
-        import random
+        import matplotlib.pyplot as plt
         test_idx = random.randint(0, df.shape[0] - 1)
         input_structure = df.iloc[test_idx, :][:get_parameter_count(self.config)].values
         input_spectrum = df.iloc[test_idx, :][get_parameter_count(self.config):].values
+        
+        # test forward simulation
+        input_forward = tf.reshape(
+            tf.convert_to_tensor(self._normalize(input_structure,self.mean,self.std)),
+            (1, get_parameter_count(self.config))
+        )
+        output_forward = self._denormalize(
+            self.model_forward(input_forward),
+            0.5,2
+        )
+        print("Forward prediction")
+        print(f"Input structure : {input_structure}")
+#         print(f"Input sig : {input_forward}")
+#         print(f"Output sig : {self.model_forward(input_forward)}")
+        plt.plot(self.ks, input_spectrum, self.ks, output_forward)
+        plt.show()
+        
+        # test inverse design
         output_structure, output_spectrum = self.design(input_spectrum)
-
         print(f"Possible structure : {[round(x * 1e9, 1) for x in input_structure]}")
         print(f"Output structure : {[round(x * 1e9, 1) for x in output_structure['d'][1:-1]]}")
-        import matplotlib.pyplot as plt
         plt.plot(self.ks, input_spectrum, self.ks, output_spectrum)
+        plt.show()
 
-    def save_model(self):
+    def save_model(self,comment=""):
         filename = hashlib.md5(str(self.config).encode()).hexdigest()
-        self.model_forward.save('models/model_foward_filename')
-        self.model_backward.save('models/model_backward_filename')
-        self.model_inverse.save('models/model_inverse_filename')
+        self.model_forward.save(f'models/model_foward_{filename}_{comment}')
+        self.model_backward.save(f'models/model_backward_{filename}_{comment}')
+        self.model_inverse.save(f'models/model_inverse_{filename}_{comment}')
